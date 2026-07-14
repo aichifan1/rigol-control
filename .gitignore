@@ -1,0 +1,14 @@
+# 数据记录文件
+[0-9]*.txt
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
