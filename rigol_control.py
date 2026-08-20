@@ -9,6 +9,7 @@ RIGOL 仪器控制面板
 """
 
 import os
+import queue
 import sys
 import threading
 import time
@@ -281,6 +282,11 @@ class RigolControlApp:
         self._protection_tripped = False
         self._reading_count = 0
 
+        # 后台线程 → GUI 线程的消息队列（tkinter 非线程安全，经队列转发）
+        self._gui_queue: queue.Queue = queue.Queue()
+        self._poll_generation = 0   # 监控代数，用于丢弃上一次监控的过期消息
+        self._closing = False       # 窗口关闭标志，防止销毁后再调度
+
         # ── 数据记录状态 ─────────────────────────────
         self._logging_active = False
         self._log_file_path: str = ""
@@ -292,7 +298,14 @@ class RigolControlApp:
         # ── 绘图数据 ─────────────────────────────────
         self._plot_times: list[float] = []    # 相对时间 (s)
         self._plot_currents: list[float] = []  # 电流 (mA)
-        self._plot_update_counter: int = 0     # 用于控制刷新频率
+        self._last_plot_update_time: float = 0.0  # 上次绘图刷新时刻
+
+        # ── 输出状态缓存（避免每次读数都查询 DG1062）──
+        self._cached_output_state: bool | None = None  # 缓存的输出状态
+        self._last_output_query_time: float = 0.0       # 上次查询输出状态时刻
+
+        # ── 数据记录节流 ─────────────────────────
+        self._last_log_write_time: float = 0.0  # 上次写入记录文件的时刻
 
         # ── 主窗口 ──────────────────────────────────────
         self.root = tk.Tk()
@@ -313,6 +326,9 @@ class RigolControlApp:
 
         # ── 初始设备扫描 ───────────────────────────
         self.root.after(100, self._refresh_devices)
+
+        # 启动 GUI 消息队列处理器（后台线程消息 → 主线程界面更新）
+        self.root.after(50, self._process_gui_queue)
 
         # ── 启动日志 ─────────────────────────────────────
         self._log_message("应用启动 — 使用 USBTMC (PyVISA) 通信")
@@ -582,7 +598,7 @@ class RigolControlApp:
         self.log_interval_var = tk.StringVar(value="1 s")
         log_interval_combo = ttk.Combobox(
             ctrl_row, textvariable=self.log_interval_var, width=10, state="readonly",
-            values=["0.25 s", "0.5 s", "1 s", "2 s", "5 s", "10 s", "30 s", "60 s"],
+            values=["0.1 s", "0.25 s", "0.5 s", "1 s", "2 s", "5 s", "10 s", "30 s", "60 s"],
         )
         log_interval_combo.pack(side="left", padx=2)
         log_interval_combo.bind("<<ComboboxSelected>>", self._on_log_interval_change)
@@ -632,9 +648,15 @@ class RigolControlApp:
         self.plot_canvas.get_tk_widget().pack(fill="both", expand=True, padx=2, pady=2)
 
     def _update_plot(self):
-        """用当前缓冲区数据刷新曲线图"""
+        """用当前缓冲区数据刷新曲线图（节流：最多每 100ms 刷新一次）"""
         if not hasattr(self, "plot_axes"):
             return
+
+        now = time.time()
+        if now - self._last_plot_update_time < 0.1:  # 距上次刷新不到 100ms，跳过
+            return
+        self._last_plot_update_time = now
+
         times = self._plot_times
         currents = self._plot_currents
 
@@ -660,13 +682,6 @@ class RigolControlApp:
 
         self.plot_figure.tight_layout()
         self.plot_canvas.draw_idle()
-
-    def _clear_plot(self):
-        """清空曲线图数据"""
-        self._plot_times.clear()
-        self._plot_currents.clear()
-        self._plot_update_counter = 0
-        self._update_plot()
 
     # ══════════════════════════════════════════════════════
     # 面板6: 消息日志
@@ -841,6 +856,11 @@ class RigolControlApp:
         connect_btn.configure(state="normal")
         disconnect_btn.configure(state="disabled")
 
+        # 断开 DG1062 时清除输出状态缓存
+        if device is self.dg1062:
+            self._cached_output_state = None
+            self._update_output_state_display()
+
         self._log_message(f"{device.name} 已断开连接", tag="warn")
         self._update_status()
 
@@ -874,6 +894,11 @@ class RigolControlApp:
         self._polling_active = True
         self._reading_count = 0
         self._protection_tripped = False
+        self.dm3068._below_count = 0  # 重置欠流计数，避免上一次监控残留
+
+        # 递增监控代数，用于丢弃上一次监控遗留的过期消息
+        self._poll_generation += 1
+        gen = self._poll_generation
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -883,7 +908,9 @@ class RigolControlApp:
         self.reading_label.configure(bg=self.COLOR_NORMAL_BG, fg="black")
         self.protect_status_label.configure(text="监控中…", foreground="#0066CC")
 
-        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, args=(gen,), daemon=True
+        )
         self._poll_thread.start()
 
         self._log_message(
@@ -892,6 +919,11 @@ class RigolControlApp:
             f"保护 {'开启' if self.settings.protection_enabled else '关闭'}",
             tag="info",
         )
+
+        # 若 DG1062 输出当前为开启状态，立即开始记录（数据将随监控流入）
+        if self.dg1062.is_connected() and self.dg1062.get_output_state() is True:
+            self._start_logging()
+
         self._update_status()
 
     def _stop_polling(self):
@@ -915,8 +947,13 @@ class RigolControlApp:
         self._log_message("监控已停止", tag="warn")
         self._update_status()
 
-    def _poll_loop(self):
-        """后台轮询循环（在 daemon 线程中运行）"""
+    def _poll_loop(self, gen: int):
+        """后台轮询循环（在 daemon 线程中运行）。
+
+        线程安全说明：tkinter 的 root.after() 非线程安全，不能在后台线程直接调用。
+        这里改为把结果放入线程安全队列 _gui_queue，由主线程定时取走并更新界面。
+        gen 为本次监控的代数，用于丢弃上一次监控遗留的过期消息。
+        """
         error_count = 0  # 连续错误计数
         while not self._poll_stop_event.is_set():
             try:
@@ -926,22 +963,60 @@ class RigolControlApp:
                 error_count += 1
                 if error_count >= 3:
                     # 连续 3 次错误才断开
-                    self.root.after(0, self._on_poll_error, str(exc))
+                    self._gui_queue.put(("poll_error", (gen, str(exc))))
                     return
                 else:
                     # 偶发错误 → 记录但继续
-                    self.root.after(0, self._log_message,
-                                    f"[重试 {error_count}/3] 读取异常: {exc}", "warn")
+                    self._gui_queue.put(
+                        ("log", (f"[重试 {error_count}/3] 读取异常: {exc}", "warn"))
+                    )
                     self._poll_stop_event.wait(0.1)
                     continue
 
-            # 通过 root.after 将结果送给 GUI 线程
-            self.root.after(0, self._on_reading, current_a)
+            # 读数经队列交给 GUI 线程处理（线程安全）
+            self._gui_queue.put(("reading", (gen, current_a)))
 
             # 可中断的等待（使用用户设定的轮询间隔）
             self._poll_stop_event.wait(self.settings.poll_interval_ms / 1000.0)
 
-        self.root.after(0, self._on_poll_stopped)
+        self._gui_queue.put(("poll_stopped", gen))
+
+    def _process_gui_queue(self):
+        """在主线程中定时清空队列，处理后台线程发来的消息（线程安全的 GUI 更新）"""
+        if self._closing:
+            return
+        try:
+            while True:
+                try:
+                    kind, payload = self._gui_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                try:
+                    if kind == "reading":
+                        gen, current_a = payload
+                        if gen == self._poll_generation:
+                            self._on_reading(current_a)
+                    elif kind == "log":
+                        message, tag = payload
+                        self._log_message(message, tag)
+                    elif kind == "poll_error":
+                        gen, error_msg = payload
+                        if gen == self._poll_generation:
+                            self._on_poll_error(error_msg)
+                    elif kind == "poll_stopped":
+                        gen = payload
+                        if gen == self._poll_generation:
+                            self._on_poll_stopped()
+                except Exception:
+                    # 单条消息处理失败不应中断后续消息处理
+                    try:
+                        self._log_message("界面更新异常（已忽略）", tag="error")
+                    except Exception:
+                        pass
+        finally:
+            if not self._closing:
+                self.root.after(50, self._process_gui_queue)
 
     # ══════════════════════════════════════════════════════
     # 读取回调（在 GUI 线程执行）
@@ -1044,7 +1119,7 @@ class RigolControlApp:
         self.protect_status_label.configure(
             text="⚠ 保护已触发 — 输出已关闭（监测继续）", foreground="#CC0000"
         )
-        self._update_output_state_display()
+        self._update_output_state_display(force_query=True)
 
         # 弹窗警告
         self.root.after(300, lambda: messagebox.showwarning(
@@ -1139,11 +1214,11 @@ class RigolControlApp:
         self._log_file_path = log_path
         self._log_entry_count = 0
         self._log_start_time = time.time()  # 记录起始时刻
+        self._last_log_write_time = 0.0     # 重置节流，确保第一条立刻写入
 
         # 清空上一轮的绘图数据
         self._plot_times.clear()
         self._plot_currents.clear()
-        self._plot_update_counter = 0
         self._update_plot()
 
         # 写入文件头
@@ -1195,16 +1270,22 @@ class RigolControlApp:
         )
 
     def _write_log_entry(self, current_a: float):
-        """将一次电流读数写入记录文件，并更新实时曲线图"""
+        """将一次电流读数写入记录文件（按设定的记录间隔节流），并更新实时曲线图"""
         if not self._logging_active or not self._log_file_handle:
             return
         try:
+            now = time.time()
+            # 按记录间隔节流：距上次写入时间不足则跳过
+            if (now - self._last_log_write_time) * 1000.0 < self._log_interval_ms:
+                return
+
             current_ma = current_a * 1000.0
-            elapsed = time.time() - self._log_start_time  # 从0开始的相对秒数
+            elapsed = now - self._log_start_time  # 从0开始的相对秒数
             line = f"{elapsed:.3f}\t{current_ma:.6f}\n"
             self._log_file_handle.write(line)
             self._log_file_handle.flush()
             self._log_entry_count += 1
+            self._last_log_write_time = now
 
             # 追加绘图数据
             self._plot_times.append(elapsed)
@@ -1214,7 +1295,7 @@ class RigolControlApp:
             if self._log_entry_count % 10 == 0:
                 self.log_count_var.set(f"已记录: {self._log_entry_count} 条")
 
-            # 刷新曲线图（每条记录都更新，draw_idle 开销小）
+            # 刷新曲线图（每条记录都触发，内部有节流控制）
             self._update_plot()
         except OSError as e:
             self._log_message(f"[错误] 写入记录文件失败: {e}", tag="error")
@@ -1234,26 +1315,55 @@ class RigolControlApp:
             self.dg1062.set_output(on)
             state_str = "开启" if on else "关闭"
             self._log_message(f"DG1062 输出: {state_str}", tag="success" if on else "warn")
-            self._update_output_state_display()
+            self._update_output_state_display(force_query=True)
 
             # 开启输出 → 自动开始记录；关闭输出 → 自动停止记录
+            # 数据只在监控轮询时产生，故仅在监控运行中才真正开始记录，
+            # 否则会写出一个没有数据的空记录块。
             if on:
-                self._start_logging()
+                if self._polling_active:
+                    self._start_logging()
+                else:
+                    self._log_message(
+                        "[提示] 监控未运行，暂不记录；开始监控后将自动开始记录",
+                        tag="warn",
+                    )
             else:
                 self._stop_logging()
         except Exception as exc:
             messagebox.showerror("操作失败", f"无法控制 DG1062 输出:\n{exc}")
             self._log_message(f"[错误] DG1062 输出控制失败: {exc}", tag="error")
 
-    def _update_output_state_display(self):
-        """更新 DG1062 输出状态显示"""
+    def _update_output_state_display(self, force_query: bool = False):
+        """更新 DG1062 输出状态显示。
+
+        为避免每次读数都阻塞查询 DG1062，默认使用缓存状态，
+        仅在以下情况才真正查询硬件：
+        - force_query=True（手动开关输出、保护触发等状态变更后）
+        - 距上次查询超过 2 秒（周期性确认）
+        """
         if not self.dg1062.is_connected():
+            self._cached_output_state = None
             self.output_state_label.configure(
                 text="DG1062 输出: ---", foreground="#888888"
             )
             return
 
-        state = self.dg1062.get_output_state()
+        now = time.time()
+        # 判断是否需要查询硬件
+        need_query = (
+            force_query
+            or self._cached_output_state is None
+            or (now - self._last_output_query_time) > 2.0  # 每 2 秒确认一次
+        )
+
+        if need_query:
+            state = self.dg1062.get_output_state()
+            self._cached_output_state = state
+            self._last_output_query_time = now
+        else:
+            state = self._cached_output_state
+
         if state is True:
             self.output_state_label.configure(
                 text="DG1062 输出: ● ON", foreground=self.COLOR_OUTPUT_ON
@@ -1307,6 +1417,7 @@ class RigolControlApp:
 
     def _on_close(self):
         """窗口关闭时的清理"""
+        self._closing = True  # 停止队列处理器继续调度，避免销毁后再回调
         self._stop_logging()
         self._stop_polling()
         self.dm3068.disconnect()
